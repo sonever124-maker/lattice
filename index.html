@@ -86,6 +86,24 @@
   ul.cutlist-main .len small{ font-size:12px; font-weight:400; color:var(--muted); }
   ul.cutlist-main .cnt{ font-size:15px; font-weight:700; color:var(--accent); white-space:nowrap; }
   ul.cutlist-main .flag{ font-size:11px; color:var(--muted); margin-right:8px; }
+
+  .cutlist-grid{ display:grid; grid-template-columns:1fr 1fr; gap:24px; align-items:start; }
+  @media (max-width: 760px){ .cutlist-grid{ grid-template-columns:1fr; } }
+  .cutlist-col .col-title{ font-size:12px; color:var(--muted); font-weight:600; margin-bottom:8px; }
+
+  ol.stock-plan{ list-style:none; margin:10px 0 0; padding:0; max-height:360px; overflow:auto; }
+  ol.stock-plan li{
+    padding:9px 12px; background:var(--bg); border:1px solid var(--border);
+    border-radius:8px; margin-bottom:6px; font-size:12.5px;
+  }
+  ol.stock-plan li .bar-head{ display:flex; justify-content:space-between; gap:10px; margin-bottom:4px; }
+  ol.stock-plan li .bar-title{ font-weight:700; }
+  ol.stock-plan li .bar-waste{ color:var(--muted); white-space:nowrap; }
+  .warn-box{
+    background:var(--danger); background:color-mix(in srgb, var(--danger) 12%, transparent);
+    border:1px solid var(--danger); color:var(--danger); border-radius:8px;
+    padding:8px 10px; font-size:12px; margin:10px 0;
+  }
 </style>
 </head>
 <body>
@@ -148,8 +166,22 @@
     <div class="result-grid" id="resultGrid"></div>
 
     <div class="section-title">필요 자재 목록 (길이 × 수량)</div>
-    <p class="note" style="margin:-4px 0 10px;">폭 c(살 폭)짜리 원자재를 아래 길이로 자르고, 양 끝을 45°로 재단하면 됩니다.</p>
-    <ul class="cutlist-main" id="cutlistMain"></ul>
+    <div class="cutlist-grid">
+      <div class="cutlist-col">
+        <p class="note" style="margin:0 0 10px;">폭 c(살 폭)짜리 원자재를 아래 길이로 자르고, 양 끝을 45°로 재단하면 됩니다.</p>
+        <ul class="cutlist-main" id="cutlistMain"></ul>
+      </div>
+      <div class="cutlist-col">
+        <div class="col-title">원자재(긴 자재) 길이로 재단 계획 짜기</div>
+        <div class="field">
+          <label>원자재 길이</label>
+          <input type="number" id="stockLength" class="dim" value="3600" min="0" step="1">
+        </div>
+        <div class="result-grid" id="stockSummary"></div>
+        <div class="warn-box" id="stockWarning" style="display:none;"></div>
+        <ol class="stock-plan" id="stockPlan"></ol>
+      </div>
+    </div>
 
     <div class="diagram-wrap">
       <div class="section-title">배치도 미리보기</div>
@@ -171,7 +203,7 @@
   const unitFactor = { mm:1, cm:10, inch:25.4 };
   let currentUnit = 'mm';
   const el = id => document.getElementById(id);
-  const dimIds = ['panelA','panelB','slatWidth','edgeOffset','pitch'];
+  const dimIds = ['panelA','panelB','slatWidth','edgeOffset','pitch','stockLength'];
 
   el('unitToggle').addEventListener('click', (e) => {
     const btn = e.target.closest('button[data-unit]');
@@ -328,6 +360,28 @@
     return `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${shapes}${ticks}</svg>`;
   }
 
+  // ---- 원자재 재단 계획 (1차원 컷팅 스톡, Best-Fit-Decreasing) ----
+  function packStock(lengths, stockLength){
+    const sorted = [...lengths].sort((a,b) => b-a);
+    const bins = [];
+    const overLength = [];
+    sorted.forEach(len => {
+      if(len > stockLength + 1e-6){ overLength.push(len); return; }
+      let best = -1, bestRemain = Infinity;
+      bins.forEach((bin, i) => {
+        const remain = bin.remaining - len;
+        if(remain >= -1e-6 && remain < bestRemain){ bestRemain = remain; best = i; }
+      });
+      if(best >= 0){
+        bins[best].pieces.push(len);
+        bins[best].remaining -= len;
+      } else {
+        bins.push({ pieces: [len], remaining: stockLength - len });
+      }
+    });
+    return { bins, overLength };
+  }
+
   function render(){
     showError(null);
     let data;
@@ -339,6 +393,9 @@
       el('diagramContainer').innerHTML = '';
       el('cutlistMain').innerHTML = '';
       el('detailTable').innerHTML = '';
+      el('stockSummary').innerHTML = '';
+      el('stockPlan').innerHTML = '';
+      el('stockWarning').style.display = 'none';
       return;
     }
 
@@ -376,6 +433,44 @@
     el('detailTable').innerHTML =
       `<tr><th>번호</th><th>길이</th><th>비고</th></tr>` +
       data.slats.map(s => `<tr><td>${s.index}</td><td class="num">${fmtLen(s.length)} ${currentUnit}</td><td>${s.isCorner?'모서리 조각(근사)':''}</td></tr>`).join('');
+
+    // 원자재 재단 계획
+    const stockLength = num('stockLength');
+    const warnEl = el('stockWarning');
+    if(stockLength <= 0){
+      el('stockSummary').innerHTML = '';
+      el('stockPlan').innerHTML = '';
+      warnEl.style.display = 'block';
+      warnEl.textContent = '원자재 길이는 0보다 커야 합니다.';
+    } else {
+      const { bins, overLength } = packStock(data.slats.map(s => s.length), stockLength);
+      const totalWaste = bins.reduce((sum, b) => sum + b.remaining, 0);
+      const totalStock = bins.length * stockLength;
+      const wastePct = totalStock > 0 ? (totalWaste / totalStock * 100) : 0;
+
+      el('stockSummary').innerHTML = [
+        { label:'필요 원자재 개수', value: `${bins.length} 개` },
+        { label:'총 낭비', value: fmt(totalWaste) },
+        { label:'낭비율', value: `${round(wastePct,1)} %` },
+      ].map(r => `<div class="stat"><div class="label">${r.label}</div><div class="value">${r.value}</div></div>`).join('');
+
+      if(overLength.length > 0){
+        warnEl.style.display = 'block';
+        warnEl.textContent = `원자재보다 긴 조각이 있어 한 번에 잘라낼 수 없습니다: ${overLength.map(l => fmtLen(l)+' '+currentUnit).join(', ')}`;
+      } else {
+        warnEl.style.display = 'none';
+      }
+
+      el('stockPlan').innerHTML = bins.map((bin, i) =>
+        `<li>
+          <div class="bar-head">
+            <span class="bar-title">원자재 ${i+1}</span>
+            <span class="bar-waste">여유 ${fmtLen(bin.remaining)} ${currentUnit}</span>
+          </div>
+          <div>${bin.pieces.map(p => fmtLen(p)).join(' + ')} ${currentUnit}</div>
+        </li>`
+      ).join('');
+    }
   }
 
   render();
